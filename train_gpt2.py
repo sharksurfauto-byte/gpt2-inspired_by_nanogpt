@@ -1,3 +1,4 @@
+from torch._inductor.fx_passes.split_cat import backend
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -213,6 +214,32 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+
+    # CUSTOM CONFIGURATION FOR ADAM OPTIMIZER
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # start with all candidate params that require grad
+        param_dict = {pn:p for pn, p in self.named_parameters()}
+        param_dict = {pn:p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2] 
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2] # 1-D params shouldnt be decayed
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        if master_process:
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == "cuda"
+        if master_process:
+            print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
     
 # ------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -226,30 +253,106 @@ device = 'cpu'
 # if torch.cuda.is_available():
 #     device = 'cuda'
 
+# Using Distributed Data Parallel (DPP)
+from torch.distributed import init_process_group, destroy_process_group
+
+# set up DDP
+# torchrun command sets up the env variables RANK, LOCAL_RANK and WORLD_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    assert torch.cuda.is_available(), 'for now i think we need cuda for ddp'
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank ==0
+else:
+    # vanilla (or) non ddp run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size=1
+    master_process=True
+    device = 'cpu'
+    if torch.cuda.is_available():
+        device = 'cuda'
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = 'mps'
+    print(f'Using device: {device}')
+
+
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
+
+
+# Now we define the GRADIENT ACCUMULATION:
+"""
+
+The GPT paper has a batch size of 0.5M tokens for similar sized model as ours. But ofc we cant pass such a huge no or else our gpu will explode. So we gradient accumulate to simulate the effect of having 0.5M tokens as batch size.
+
+"""
+
+total_batch_size = 524288 # 2^19 ~ 0.5M in terms of tokens
+B=16
+T=1024
+assert total_batch_size % (B*T*ddp_world_size) == 0, 'make sure total_batch_size is divisible by B*T*ddp_world_size'
+grad_accum_steps = total_batch_size//(B*T*ddp_world_size)
+if master_process:
+    print(f"Total desired batch size: {total_batch_size}.")
+    print(f"=> calculated grad accumulation steps = {grad_accum_steps}.")
+
 
 # ------------------------------------------------------------------------------------------------------------------------------------------------
 
 # setting up a DataLoader
 import tiktoken
+import numpy as np
+
+def load_tokens(filename):
+    npt = np.load(filename)
+    ptt = torch.tensor(npt, dtype = torch.long)
+    return ptt
+
+
 class DataLoaderLite:
-    def __init__(self, B,T):
+    def __init__(self, B,T, process_rank, num_processes, split):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        assert split in {'train', 'val'}
 
-        # at init load tokens from disk and store them in memory
-        with open ('input.txt', 'r') as f:
-            text = f.read()
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
+        # # at init load tokens from disk and store them in memory
+        # with open ('input.txt', 'r') as f:
+        #     text = f.read()
+        # enc = tiktoken.get_encoding('gpt2')
+        # tokens = enc.encode(text)
+        # self.tokens = torch.tensor(tokens)
+        # print(f"loaded {len(self.tokens)} tokens")
+        # print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
 
-        # state
-        self.current_position = 0
+        # # state
+        # self.current_position = self.B * self.T * self.process_rank 
+
+        # get the shard files:
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root,s) for s in shards]
+        self.shards = shards
+        assert len(shards)>0, f'no shards found in split {split}.'
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}.")
+        self.reset()
+
+        # state, init at shard zero
+        def reset():
+            self.current_shard = 0
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B,T = self.B, self.T
@@ -258,21 +361,28 @@ class DataLoaderLite:
         y = (buf[1:]).view(B,T) # targets
 
         # update the pointer
-        self.current_position += B*T
+        self.current_position += B*T* self.num_processes
         #if laoding the next batch would be out of bounds, reset
-        if self.current_position + (B*T+1)> len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (B*T*self.num_processes+1)> len(self.tokens):
+            self.current_shard = (self.current_shard+1)%len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position =  B*T*self.process_rank 
         
         return x,y
 
-train_loader = DataLoaderLite(B=4, T=256)
+train_loader = DataLoaderLite(B=4, T=256, process_rank = ddp_rank, num_processes=ddp_world_size, split='train')
+val_loader = DataLoaderLite(B=4, T=256, process_rank = ddp_rank, num_processes=ddp_world_size, split='val')
 
 torch.set_float32_matmul_precision('high') # reduces memory usage and increases speed as we are now using tf32 instead of fp32
 
-# get logits
+# create model
+
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
-#model = torch.compile(model) # basically increases the speed of the program a lot by compiling it first (like compilers used c, c++) # NOTE: requires MSVC (cl.exe) on Windows
+model = torch.compile(model) # basically increases the speed of the program a lot by compiling it first (like compilers used c, c++)
+
+if ddp:
+    model = DDP(model, device_ids = [ddp_local_rank])
 
 # WE DO LEARNING RATE SCHEDULING:
 max_lr = 6e-4
@@ -292,15 +402,34 @@ def get_lr(it):
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes till 0
         return min_lr + coeff * (max_lr - min_lr)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-4, betas = (0.9, 0.95), eps = 1e-8)
+#optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-4, betas = (0.9, 0.95), eps = 1e-8)
+
+# we are gonna use a custom optimizer function:
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate = 6e-4, device = device)
+
+# ------------------------------------------------------------------------------------------------------------------------------------------------
+
+""" TRAINING LOOOP  """
+
 for step in range(50):
-    t0 = time.time()
-    x,y = train_loader.next_batch()
-    x,y = x.to(device), y.to(device)
-    # with (torch.autocast(device_type=device, dtype = torch.bfloat16)):     # add when u have cuda access
+    t0 = time.time() 
+    
     optimizer.zero_grad() # starts optmizer with 0
-    logits, loss = model(x,y) # NOTE: torch.autocast with bfloat16 is a GPU optimization, skipping on CPU
-    loss.backward() # adds the losses to the optimizer
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x,y = train_loader.next_batch()
+        x,y = x.to(device), y.to(device)
+        # with (torch.autocast(device_type=device, dtype = torch.bfloat16)):     # add when u have cuda access
+        logits, loss = model(x,y) # NOTE: torch.autocast with bfloat16 is a GPU optimization, skipping on CPU
+        loss = loss/grad_accum_steps # had a whole ass reasoning as why MSE has issues without this step
+        loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = (micro_step==grad_accum_steps-1)
+        loss.backward() # adds the losses to the optimizer
+    
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+    
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # we clip the global norm of the gradient at 1.0 (scr = GPT3 paper)
     # determine and set the lr for the current step
     lr = get_lr(step)
@@ -311,8 +440,11 @@ for step in range(50):
         torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1-t0)*1000 # time diff in miliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T)/(t1-t0)
-    print(f"step {step} | loss: {loss.item():.4f} | norm: {norm:.4f} | dt: {dt:.4f}ms | tokens/sec: {tokens_per_sec}")
+    tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps*ddp_world_size)/(t1-t0)
+    if master_process:
+        print(f"step {step} | loss: {loss_accum.item():.4f} | lr: {lr:.4f} | norm: {norm:.4f} | dt: {dt:.4f}ms | tokens/sec: {tokens_per_sec}")
+if ddp:
+    destroy_process_group()
 
 """
 We are getting a loss of 11.04. Now why is it somewhat good?
